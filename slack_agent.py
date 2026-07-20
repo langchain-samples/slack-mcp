@@ -44,11 +44,8 @@ def _slack_client() -> WebClient:
     return WebClient(token=token)
 
 
-def list_channels() -> str:
-    """List every public and private Slack channel visible to the token.
-
-    Returns visibility-labeled "#name (ID)" entries and summary counts.
-    """
+def _list_visible_channels() -> tuple[list[dict], str | None]:
+    """Fetch all visible public/private channels with bounded retries."""
     client = _slack_client()
     channels: list[dict] = []
     cursor: str | None = None
@@ -66,11 +63,11 @@ def list_channels() -> str:
         except SlackApiError as e:
             error = e.response.get("error", "unknown_error")
             if error != "ratelimited":
-                return f"Slack API error: {error}"
+                return [], f"Slack API error: {error}"
 
             rate_limit_retries += 1
             if rate_limit_retries > 2:
-                return "Slack API error: ratelimited after 2 retries"
+                return [], "Slack API error: ratelimited after 2 retries"
 
             try:
                 retry_after = int(e.response.headers.get("retry-after", "1"))
@@ -85,12 +82,11 @@ def list_channels() -> str:
         if not cursor:
             break
 
-    if not channels:
-        return (
-            "No visible channels found (or the token lacks 'channels:read' and "
-            "'groups:read')."
-        )
+    return channels, None
 
+
+def _format_channels(channels: list[dict], label: str) -> str:
+    """Format visibility-labeled channels and summary counts."""
     public_count = sum(not c.get("is_private", False) for c in channels)
     private_count = len(channels) - public_count
     ordered = sorted(
@@ -103,9 +99,45 @@ def list_channels() -> str:
         for c in ordered
     ]
     return (
-        f"Found {len(channels)} visible channel(s): {public_count} public, "
+        f"Found {len(channels)} {label}: {public_count} public, "
         f"{private_count} private.\n" + "\n".join(lines)
     )
+
+
+def list_channels() -> str:
+    """List every public and private Slack channel visible to the token.
+
+    Returns visibility-labeled "#name (ID)" entries and summary counts.
+    """
+    channels, error = _list_visible_channels()
+    if error:
+        return error
+
+    if not channels:
+        return (
+            "No visible channels found (or the token lacks 'channels:read' and "
+            "'groups:read')."
+        )
+
+    return _format_channels(channels, "visible channel(s)")
+
+
+def list_eval_channels() -> str:
+    """List public/private `eval-` channels the Slack identity belongs to."""
+    channels, error = _list_visible_channels()
+    if error:
+        return error
+
+    eval_channels = [
+        channel
+        for channel in channels
+        if channel.get("name", "").startswith("eval-")
+        and channel.get("is_member", False)
+    ]
+    if not eval_channels:
+        return "No active eval- channels found for this Slack identity."
+
+    return _format_channels(eval_channels, "eval- channel(s)")
 
 
 def _gateway_api_key() -> str:
@@ -130,11 +162,12 @@ model = init_chat_model(
 
 agent = create_agent(
     model=model,
-    tools=[list_channels],
+    tools=[list_channels, list_eval_channels],
     system_prompt=(
-        "You are a Slack assistant. For any question about available channels or "
-        "channel membership, always call list_channels and answer from its result. "
-        "Never ask for, reveal, or repeat credentials. Do not invent channels or IDs."
+        "You are a Slack assistant. For questions about eval channels, always call "
+        "list_eval_channels. For other channel listing or membership questions, call "
+        "list_channels. Answer only from tool results. Never ask for, reveal, or "
+        "repeat credentials. Do not invent channels or IDs."
     ),
 )
 

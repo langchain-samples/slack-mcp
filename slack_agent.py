@@ -1,10 +1,10 @@
-"""A LangChain agent that lists private Slack channels through LangSmith Gateway.
+"""A LangChain agent that lists Slack channels through LangSmith Gateway.
 
 Setup
 -----
 1. Create a Slack app at https://api.slack.com/apps and add an OAuth token with
-   the `groups:read` scope (a User token lists the private channels *you* are in;
-   a Bot token lists the private channels the *bot* has been added to).
+   the `channels:read` and `groups:read` scopes. Private channels are visible
+   only when the authenticated user or bot has access to them.
 2. Export the credentials (never hardcode them):
 
        export SLACK_USER_TOKEN="xoxp-..."  # or xoxb-... for a bot token
@@ -22,6 +22,7 @@ Setup
 from __future__ import annotations
 
 import os
+import time
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
@@ -43,41 +44,68 @@ def _slack_client() -> WebClient:
     return WebClient(token=token)
 
 
-def list_private_channels() -> str:
-    """List the private Slack channels the authenticated user is a member of.
+def list_channels() -> str:
+    """List every public and private Slack channel visible to the token.
 
-    Returns a newline-separated list of "#name (ID)" entries, or a message
-    saying none were found.
+    Returns visibility-labeled "#name (ID)" entries and summary counts.
     """
     client = _slack_client()
     channels: list[dict] = []
     cursor: str | None = None
+    rate_limit_retries = 0
 
-    try:
-        # Paginate through all results; conversations.list caps each page.
-        while True:
+    # Paginate through all results and honor Slack's rate-limit response.
+    while True:
+        try:
             resp = client.conversations_list(
-                types="private_channel",
+                types="public_channel,private_channel",
                 exclude_archived=True,
-                limit=200,
+                limit=999,
                 cursor=cursor,
             )
-            channels.extend(resp.get("channels", []))
-            cursor = resp.get("response_metadata", {}).get("next_cursor")
-            if not cursor:
-                break
-    except SlackApiError as e:
-        # Surface the Slack error code, not the token or raw request.
-        return f"Slack API error: {e.response.get('error', 'unknown_error')}"
+        except SlackApiError as e:
+            error = e.response.get("error", "unknown_error")
+            if error != "ratelimited":
+                return f"Slack API error: {error}"
 
-    # A user token already scopes to channels you're in; keep the is_member
-    # guard so a bot token behaves the same way.
-    mine = [c for c in channels if c.get("is_member", True)]
-    if not mine:
-        return "You are not a member of any private channels (or the token lacks 'groups:read')."
+            rate_limit_retries += 1
+            if rate_limit_retries > 2:
+                return "Slack API error: ratelimited after 2 retries"
 
-    lines = [f"#{c['name']} ({c['id']})" for c in sorted(mine, key=lambda c: c["name"])]
-    return f"Found {len(lines)} private channel(s):\n" + "\n".join(lines)
+            try:
+                retry_after = int(e.response.headers.get("retry-after", "1"))
+            except (TypeError, ValueError):
+                retry_after = 1
+            time.sleep(max(1, min(retry_after, 30)))
+            continue
+
+        rate_limit_retries = 0
+        channels.extend(resp.get("channels", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    if not channels:
+        return (
+            "No visible channels found (or the token lacks 'channels:read' and "
+            "'groups:read')."
+        )
+
+    public_count = sum(not c.get("is_private", False) for c in channels)
+    private_count = len(channels) - public_count
+    ordered = sorted(
+        channels,
+        key=lambda c: (c.get("is_private", False), c.get("name", "")),
+    )
+    lines = [
+        f"[{'private' if c.get('is_private', False) else 'public'}] "
+        f"#{c.get('name', 'unknown')} ({c.get('id', 'unknown')})"
+        for c in ordered
+    ]
+    return (
+        f"Found {len(channels)} visible channel(s): {public_count} public, "
+        f"{private_count} private.\n" + "\n".join(lines)
+    )
 
 
 def _gateway_api_key() -> str:
@@ -102,11 +130,11 @@ model = init_chat_model(
 
 agent = create_agent(
     model=model,
-    tools=[list_private_channels],
+    tools=[list_channels],
     system_prompt=(
-        "You are a Slack assistant. When asked to list private channels, always "
-        "call list_private_channels and present its result clearly. Never ask for, "
-        "reveal, or repeat credentials. Do not invent channels or IDs."
+        "You are a Slack assistant. For any question about available channels or "
+        "channel membership, always call list_channels and answer from its result. "
+        "Never ask for, reveal, or repeat credentials. Do not invent channels or IDs."
     ),
 )
 

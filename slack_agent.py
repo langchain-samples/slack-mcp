@@ -140,6 +140,36 @@ def list_eval_channels() -> str:
     return _format_channels(eval_channels, "eval- channel(s)")
 
 
+def list_public() -> str:
+    """List every active public Slack channel visible to the token."""
+    channels, error = _list_visible_channels()
+    if error:
+        return error
+
+    public_channels = [
+        channel for channel in channels if not channel.get("is_private", False)
+    ]
+    if not public_channels:
+        return "No active public channels are visible to this Slack identity."
+
+    return _format_channels(public_channels, "public channel(s)")
+
+
+def list_private() -> str:
+    """List every active private Slack channel accessible to the token."""
+    channels, error = _list_visible_channels()
+    if error:
+        return error
+
+    private_channels = [
+        channel for channel in channels if channel.get("is_private", False)
+    ]
+    if not private_channels:
+        return "No active private channels are visible to this Slack identity."
+
+    return _format_channels(private_channels, "private channel(s)")
+
+
 def _gateway_api_key() -> str:
     """Read the LangSmith Gateway service key without logging it."""
     api_key = os.environ.get("LANGSMITH_API_KEY_GATEWAY") or os.environ.get(
@@ -162,12 +192,14 @@ model = init_chat_model(
 
 agent = create_agent(
     model=model,
-    tools=[list_channels, list_eval_channels],
+    tools=[list_channels, list_eval_channels, list_public, list_private],
     system_prompt=(
         "You are a Slack assistant. For questions about eval channels, always call "
-        "list_eval_channels. For other channel listing or membership questions, call "
-        "list_channels. Answer only from tool results. Never ask for, reveal, or "
-        "repeat credentials. Do not invent channels or IDs."
+        "list_eval_channels. For public-only channel requests, call list_public. For "
+        "private-only channel requests, call list_private. For general channel "
+        "listing or membership questions, call list_channels. Answer only from tool "
+        "results. Never ask for, reveal, or repeat credentials. Do not invent "
+        "channels or IDs."
     ),
 )
 

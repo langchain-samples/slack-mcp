@@ -10,6 +10,8 @@ The agent has two Slack tools:
 - `list_channels`: all visible public and accessible private channels.
 - `list_eval_channels`: only active `eval-` channels where the Slack identity is
   a member, across both public and private channels.
+- `list_public`: all active public channels visible to the Slack identity.
+- `list_private`: all active private channels accessible to the Slack identity.
 
 ## Local setup
 

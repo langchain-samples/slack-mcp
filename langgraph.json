@@ -4,7 +4,7 @@
   "graphs": {
     "list_private_slack_channels": {
       "path": "./slack_agent.py:graph",
-      "description": "A Slack assistant that uses Claude through LangSmith Gateway to list visible Slack channels, including a focused tool for public/private eval- channels the shared Slack identity belongs to."
+      "description": "A Slack assistant that uses Claude through LangSmith Gateway with tools for all visible channels, public channels, accessible private channels, and joined public/private eval- channels."
     }
   },
   "env": ".env"

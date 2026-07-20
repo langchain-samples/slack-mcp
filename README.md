@@ -5,7 +5,7 @@ Deployment MCP endpoint. The agent uses `claude-sonnet-4-6` through LangSmith
 Gateway and can call Slack to list the private channels visible to the
 configured Slack identity, along with all visible public channels.
 
-The agent has two Slack tools:
+The agent has four Slack tools:
 
 - `list_channels`: all visible public and accessible private channels.
 - `list_eval_channels`: only active `eval-` channels where the Slack identity is
@@ -25,6 +25,10 @@ Store the token in an untracked `.env` file:
 SLACK_USER_TOKEN=xoxb-...
 LANGSMITH_API_KEY_GATEWAY=<gateway-user-service-key>
 ```
+
+`SLACK_USER_TOKEN` must have `channels:read` and `groups:read`. The Gateway key
+must use the `gateway-user` role. The code also accepts the legacy local names
+`SLACK_TOKEN` and `LANGSMITH_API_GATEWAY_TOKEN`.
 
 Invoke the agent locally:
 

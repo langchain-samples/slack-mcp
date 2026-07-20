@@ -1,91 +1,98 @@
-"""A LangChain agent that lists Slack channels through LangSmith Gateway.
-
-Setup
------
-1. Create a Slack app at https://api.slack.com/apps and add an OAuth token with
-   the `channels:read` and `groups:read` scopes. Private channels are visible
-   only when the authenticated user or bot has access to them.
-2. Export the credentials (never hardcode them):
-
-       export SLACK_USER_TOKEN="xoxp-..."  # or xoxb-... for a bot token
-       export LANGSMITH_API_KEY_GATEWAY="<gateway-user-service-key>"
-
-   Or source the local `.env`:
-
-       set -a && source .env && set +a
-
-3. Invoke the agent:
-
-       uv run python -c 'from slack_agent import agent; print(agent.invoke({"messages": [{"role": "user", "content": "List my private channels."}]}))'
-"""
+"""Slack channel tools exposed through a Gateway-backed LangChain agent."""
 
 from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
+from typing import TypedDict, cast
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+CHANNEL_TYPES = "public_channel,private_channel"
+PAGE_SIZE = 999
+MAX_RATE_LIMIT_RETRIES = 2
+MIN_RETRY_DELAY_SECONDS = 1
+MAX_RETRY_DELAY_SECONDS = 30
+
+MODEL_NAME = "claude-sonnet-4-6"
+MODEL_PROVIDER = "anthropic"
+GATEWAY_BASE_URL = "https://gateway.smith.langchain.com/anthropic"
+
+
+class Channel(TypedDict, total=False):
+    """Slack channel fields used by this application."""
+
+    id: str
+    name: str
+    is_member: bool
+    is_private: bool
+
+
+class ChannelFetchError(RuntimeError):
+    """A safe, user-facing Slack channel fetch error."""
+
 
 def _slack_client() -> WebClient:
-    """Build a Slack client from SLACK_USER_TOKEN (or SLACK_TOKEN as fallback).
-
-    The token is read from the environment only and is never logged or returned.
-    """
+    """Build a Slack client from an environment-provided token."""
     token = os.environ.get("SLACK_USER_TOKEN") or os.environ.get("SLACK_TOKEN")
     if not token:
         raise RuntimeError(
             "SLACK_USER_TOKEN is not set. Export a Slack OAuth token with the "
-            "'groups:read' scope, e.g. `export SLACK_USER_TOKEN=xoxp-...`."
+            "'channels:read' and 'groups:read' scopes."
         )
     return WebClient(token=token)
 
 
-def _list_visible_channels() -> tuple[list[dict], str | None]:
+def _retry_delay(error: SlackApiError) -> int:
+    """Return Slack's bounded Retry-After delay."""
+    try:
+        delay = int(error.response.headers.get("retry-after", "1"))
+    except (TypeError, ValueError):
+        delay = MIN_RETRY_DELAY_SECONDS
+    return max(MIN_RETRY_DELAY_SECONDS, min(delay, MAX_RETRY_DELAY_SECONDS))
+
+
+def _fetch_visible_channels() -> list[Channel]:
     """Fetch all visible public/private channels with bounded retries."""
     client = _slack_client()
-    channels: list[dict] = []
+    channels: list[Channel] = []
     cursor: str | None = None
-    rate_limit_retries = 0
+    retries = 0
 
-    # Paginate through all results and honor Slack's rate-limit response.
     while True:
         try:
-            resp = client.conversations_list(
-                types="public_channel,private_channel",
+            response = client.conversations_list(
+                types=CHANNEL_TYPES,
                 exclude_archived=True,
-                limit=999,
+                limit=PAGE_SIZE,
                 cursor=cursor,
             )
-        except SlackApiError as e:
-            error = e.response.get("error", "unknown_error")
-            if error != "ratelimited":
-                return [], f"Slack API error: {error}"
+        except SlackApiError as error:
+            code = error.response.get("error", "unknown_error")
+            if code != "ratelimited":
+                raise ChannelFetchError(f"Slack API error: {code}") from error
 
-            rate_limit_retries += 1
-            if rate_limit_retries > 2:
-                return [], "Slack API error: ratelimited after 2 retries"
+            retries += 1
+            if retries > MAX_RATE_LIMIT_RETRIES:
+                raise ChannelFetchError(
+                    f"Slack API error: ratelimited after {MAX_RATE_LIMIT_RETRIES} retries"
+                ) from error
 
-            try:
-                retry_after = int(e.response.headers.get("retry-after", "1"))
-            except (TypeError, ValueError):
-                retry_after = 1
-            time.sleep(max(1, min(retry_after, 30)))
+            time.sleep(_retry_delay(error))
             continue
 
-        rate_limit_retries = 0
-        channels.extend(resp.get("channels", []))
-        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        retries = 0
+        channels.extend(cast(list[Channel], response.get("channels", [])))
+        cursor = response.get("response_metadata", {}).get("next_cursor")
         if not cursor:
-            break
-
-    return channels, None
+            return channels
 
 
-def _format_channels(channels: list[dict], label: str) -> str:
+def _format_channels(channels: list[Channel], label: str) -> str:
     """Format visibility-labeled channels and summary counts."""
     public_count = sum(not c.get("is_private", False) for c in channels)
     private_count = len(channels) - public_count
@@ -104,70 +111,79 @@ def _format_channels(channels: list[dict], label: str) -> str:
     )
 
 
+def _all_channels(_: Channel) -> bool:
+    return True
+
+
+def _is_eval_member(channel: Channel) -> bool:
+    return channel.get("name", "").startswith("eval-") and channel.get(
+        "is_member", False
+    )
+
+
+def _is_public(channel: Channel) -> bool:
+    return not channel.get("is_private", False)
+
+
+def _is_private(channel: Channel) -> bool:
+    return channel.get("is_private", False)
+
+
+def _channel_response(
+    predicate: Callable[[Channel], bool],
+    *,
+    label: str,
+    empty_message: str,
+) -> str:
+    """Fetch, filter, and format one channel-tool response."""
+    try:
+        channels = _fetch_visible_channels()
+    except ChannelFetchError as error:
+        return str(error)
+
+    matching = [channel for channel in channels if predicate(channel)]
+    if not matching:
+        return empty_message
+    return _format_channels(matching, label)
+
+
 def list_channels() -> str:
-    """List every public and private Slack channel visible to the token.
-
-    Returns visibility-labeled "#name (ID)" entries and summary counts.
-    """
-    channels, error = _list_visible_channels()
-    if error:
-        return error
-
-    if not channels:
-        return (
+    """List every active public/private Slack channel visible to the token."""
+    return _channel_response(
+        _all_channels,
+        label="visible channel(s)",
+        empty_message=(
             "No visible channels found (or the token lacks 'channels:read' and "
             "'groups:read')."
-        )
-
-    return _format_channels(channels, "visible channel(s)")
+        ),
+    )
 
 
 def list_eval_channels() -> str:
-    """List public/private `eval-` channels the Slack identity belongs to."""
-    channels, error = _list_visible_channels()
-    if error:
-        return error
-
-    eval_channels = [
-        channel
-        for channel in channels
-        if channel.get("name", "").startswith("eval-")
-        and channel.get("is_member", False)
-    ]
-    if not eval_channels:
-        return "No active eval- channels found for this Slack identity."
-
-    return _format_channels(eval_channels, "eval- channel(s)")
+    """List joined public/private Slack channels whose names start with `eval-`."""
+    return _channel_response(
+        _is_eval_member,
+        label="eval- channel(s)",
+        empty_message="No active eval- channels found for this Slack identity.",
+    )
 
 
 def list_public() -> str:
     """List every active public Slack channel visible to the token."""
-    channels, error = _list_visible_channels()
-    if error:
-        return error
-
-    public_channels = [
-        channel for channel in channels if not channel.get("is_private", False)
-    ]
-    if not public_channels:
-        return "No active public channels are visible to this Slack identity."
-
-    return _format_channels(public_channels, "public channel(s)")
+    return _channel_response(
+        _is_public,
+        label="public channel(s)",
+        empty_message="No active public channels are visible to this Slack identity.",
+    )
 
 
 def list_private() -> str:
     """List every active private Slack channel accessible to the token."""
-    channels, error = _list_visible_channels()
-    if error:
-        return error
-
-    private_channels = [
-        channel for channel in channels if channel.get("is_private", False)
-    ]
-    if not private_channels:
-        return "No active private channels are visible to this Slack identity."
-
-    return _format_channels(private_channels, "private channel(s)")
+    return _channel_response(
+        _is_private,
+        label="private channel(s)",
+        empty_message="No active private channels are visible to this Slack identity.",
+    )
 
 
 def _gateway_api_key() -> str:
@@ -184,9 +200,9 @@ def _gateway_api_key() -> str:
 
 
 model = init_chat_model(
-    model="claude-sonnet-4-6",
-    model_provider="anthropic",
-    base_url="https://gateway.smith.langchain.com/anthropic",
+    model=MODEL_NAME,
+    model_provider=MODEL_PROVIDER,
+    base_url=GATEWAY_BASE_URL,
     api_key=_gateway_api_key(),
 )
 

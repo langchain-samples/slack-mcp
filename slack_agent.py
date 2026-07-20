@@ -1,4 +1,4 @@
-"""A LangChain agent that lists private Slack channels through OpenRouter.
+"""A LangChain agent that lists private Slack channels through LangSmith Gateway.
 
 Setup
 -----
@@ -8,7 +8,7 @@ Setup
 2. Export the credentials (never hardcode them):
 
        export SLACK_USER_TOKEN="xoxp-..."  # or xoxb-... for a bot token
-       export OPENROUTER_API_KEY="sk-or-v1-..."
+       export LANGSMITH_API_KEY_GATEWAY="<gateway-user-service-key>"
 
    Or source the local `.env`:
 
@@ -80,23 +80,24 @@ def list_private_channels() -> str:
     return f"Found {len(lines)} private channel(s):\n" + "\n".join(lines)
 
 
-def _openrouter_api_key() -> str:
-    """Read the OpenRouter credential without logging or returning it."""
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get(
-        "OPEN_ROUTER_API_KEY"
+def _gateway_api_key() -> str:
+    """Read the LangSmith Gateway service key without logging it."""
+    api_key = os.environ.get("LANGSMITH_API_KEY_GATEWAY") or os.environ.get(
+        "LANGSMITH_API_GATEWAY_TOKEN"
     )
     if not api_key:
         raise RuntimeError(
-            "OPENROUTER_API_KEY is not set. Configure it as a deployment secret."
+            "LANGSMITH_API_KEY_GATEWAY is not set. Configure a gateway-user "
+            "service key as a deployment secret."
         )
     return api_key
 
 
 model = init_chat_model(
-    model="nvidia/nemotron-3-ultra-550b-a55b:free",
-    model_provider="openai",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=_openrouter_api_key(),
+    model="claude-sonnet-4-6",
+    model_provider="anthropic",
+    base_url="https://gateway.smith.langchain.com/anthropic",
+    api_key=_gateway_api_key(),
 )
 
 agent = create_agent(

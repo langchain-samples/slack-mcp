@@ -1,0 +1,11 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "list_private_slack_channels": {
+      "path": "./slack_agent.py:graph",
+      "description": "A Slack assistant that uses OpenRouter Nemotron to list and present private channels visible to the configured shared Slack identity."
+    }
+  },
+  "env": ".env"
+}

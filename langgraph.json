@@ -1,6 +1,9 @@
 {
   "$schema": "https://langgra.ph/schema.json",
   "dependencies": ["."],
+  "auth": {
+    "path": "./auth.py:auth"
+  },
   "graphs": {
     "list_private_slack_channels": {
       "path": "./slack_agent.py:graph",
@@ -25,6 +28,10 @@
     "list_customer_channels": {
       "path": "./slack_agent.py:customer_channels_graph",
       "description": "List every visible public and private Slack channel whose name starts with customer-."
+    },
+    "refresh_channels": {
+      "path": "./slack_agent.py:refresh_channels_graph",
+      "description": "Refresh the caller's durable Slack channel snapshot from Slack."
     }
   },
   "env": ".env"

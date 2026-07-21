@@ -2,12 +2,13 @@ import importlib
 import os
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.slack_response import SlackResponse
+from langgraph.store.memory import InMemoryStore
 
-os.environ.setdefault("SLACK_USER_TOKEN", "test-slack-token")
 os.environ.setdefault("LANGSMITH_API_GATEWAY_TOKEN", "test-gateway-token")
 
 slack_agent = importlib.import_module("slack_agent")
@@ -23,20 +24,44 @@ CHANNELS = [
 ]
 
 
+def runtime(
+    token="test-slack-token",
+    identity="T1:U1",
+    store=None,
+):
+    return SimpleNamespace(
+        config={
+            "configurable": {
+                "langgraph_auth_user": {
+                    "identity": identity,
+                    "slack_token": token,
+                },
+            }
+        },
+        store=store,
+        state={},
+    )
+
+
+def config(token="test-slack-token"):
+    return runtime(token).config
+
+
 class ChannelToolTests(unittest.TestCase):
     @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
-    def test_public_and_private_filters(self, _fetch):
-        public = slack_agent.list_public()
-        private = slack_agent.list_private()
+    def test_public_and_private_filters(self, fetch):
+        public = slack_agent.list_public(runtime())
+        private = slack_agent.list_private(runtime())
 
         self.assertIn("Found 4 public channel(s)", public)
         self.assertNotIn("#eval-private", public)
         self.assertIn("Found 2 private channel(s)", private)
         self.assertIn("#eval-private", private)
+        self.assertEqual(fetch.call_args_list[0].args, ("test-slack-token",))
 
     @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
     def test_eval_filter_returns_all_visible_channels(self, _fetch):
-        result = slack_agent.list_eval_channels()
+        result = slack_agent.list_eval_channels(runtime())
 
         self.assertIn("Found 3 eval- channel(s)", result)
         self.assertIn("#eval-public", result)
@@ -45,7 +70,7 @@ class ChannelToolTests(unittest.TestCase):
 
     @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
     def test_customer_filter_returns_all_visible_channels(self, _fetch):
-        result = slack_agent.list_customer_channels()
+        result = slack_agent.list_customer_channels(runtime())
 
         self.assertIn("Found 2 customer- channel(s)", result)
         self.assertIn("#customer-public", result)
@@ -56,12 +81,120 @@ class ChannelToolTests(unittest.TestCase):
         side_effect=slack_agent.ChannelFetchError("Slack API error: test"),
     )
     def test_safe_fetch_error_is_returned(self, _fetch):
-        self.assertEqual(slack_agent.list_channels(), "Slack API error: test")
+        self.assertEqual(
+            slack_agent.list_channels(runtime()),
+            "Slack API error: test",
+        )
 
     def test_direct_directory_graph_returns_tool_result(self):
-        graph = slack_agent._build_directory_graph(lambda: "directory-result")
+        def directory_tool(tool_runtime):
+            self.assertEqual(
+                slack_agent._slack_token_from_config(tool_runtime.config),
+                "request-token",
+            )
+            return "directory-result"
 
-        self.assertEqual(graph.invoke({}), {"result": "directory-result"})
+        graph = slack_agent._build_directory_graph(
+            directory_tool,
+            store=InMemoryStore(),
+        )
+
+        self.assertEqual(
+            graph.invoke({}, config=config("request-token")),
+            {"result": "directory-result"},
+        )
+
+    def test_missing_request_credentials_fail_without_secret_details(self):
+        with self.assertRaisesRegex(RuntimeError, "credentials are unavailable"):
+            slack_agent.list_channels(SimpleNamespace(config={}, store=None))
+
+
+class DurableSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        slack_agent._clear_channel_cache()
+        self.store = InMemoryStore()
+
+    @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
+    def test_warm_snapshot_skips_slack(self, fetch):
+        caller = runtime(store=self.store)
+        slack_agent._write_snapshot(caller, CHANNELS)
+
+        first = slack_agent.list_eval_channels(caller)
+        second = slack_agent.list_eval_channels(caller)
+
+        self.assertEqual(first, second)
+        fetch.assert_not_called()
+
+    @patch("slack_agent._fetch_visible_channels")
+    def test_missing_deployed_snapshot_does_not_call_slack(self, fetch):
+        result = slack_agent.list_channels(runtime(store=self.store))
+
+        self.assertIn("Call refresh_channels once", result)
+        fetch.assert_not_called()
+
+    @patch("slack_agent._fetch_visible_channels")
+    def test_snapshots_are_isolated_by_authenticated_identity(self, fetch):
+        liam_runtime = runtime(identity="T1:LIAM", store=self.store)
+        morgan_runtime = runtime(identity="T1:MORGAN", store=self.store)
+        slack_agent._write_snapshot(
+            liam_runtime,
+            [{"name": "eval-liam", "id": "C1", "is_private": False}],
+        )
+        slack_agent._write_snapshot(
+            morgan_runtime,
+            [{"name": "eval-morgan", "id": "C2", "is_private": False}],
+        )
+
+        liam = slack_agent.list_eval_channels(liam_runtime)
+        morgan = slack_agent.list_eval_channels(morgan_runtime)
+
+        self.assertIn("eval-liam", liam)
+        self.assertNotIn("eval-morgan", liam)
+        self.assertIn("eval-morgan", morgan)
+        self.assertNotIn("eval-liam", morgan)
+        fetch.assert_not_called()
+
+    @patch("slack_agent._fetch_channels_from_slack", return_value=CHANNELS)
+    def test_refresh_replaces_snapshot_without_persisting_token(self, fetch):
+        caller = runtime(token="never-persist-this-token", store=self.store)
+
+        result = slack_agent.refresh_channels(caller)
+        item = self.store.get(
+            (slack_agent.SNAPSHOT_NAMESPACE, "T1:U1"),
+            slack_agent.SNAPSHOT_STORE_KEY,
+        )
+
+        self.assertIn("Refreshed", result)
+        self.assertIsNotNone(item)
+        self.assertNotIn("never-persist-this-token", repr(item.value))
+        fetch.assert_called_once_with("never-persist-this-token")
+
+    @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
+    def test_agent_filesystem_can_read_but_not_write_snapshot(self, _fetch):
+        caller = runtime(store=self.store)
+        slack_agent._write_snapshot(caller, CHANNELS)
+        backend = slack_agent._agent_backend(caller)
+
+        content = backend.read(slack_agent.SNAPSHOT_FILE_PATH)
+        denied = backend.write(slack_agent.SNAPSHOT_FILE_PATH, "[]")
+
+        self.assertIsNone(content.error)
+        self.assertIn("eval-public", content.file_data["content"])
+        self.assertIn("read-only", denied.error)
+
+    @patch("slack_agent._fetch_visible_channels")
+    def test_direct_mcp_graph_reads_durable_snapshot(self, fetch):
+        caller = runtime(store=self.store)
+        slack_agent._write_snapshot(caller, CHANNELS)
+        graph = slack_agent._build_directory_graph(
+            slack_agent.list_eval_channels,
+            store=self.store,
+        )
+
+        result = graph.invoke({}, config=caller.config)
+
+        self.assertIn("#eval-public", result["result"])
+        fetch.assert_not_called()
 
 
 class FetchTests(unittest.TestCase):
@@ -104,25 +237,23 @@ class FetchTests(unittest.TestCase):
         client_factory.assert_called_once_with("test-token")
         sleep.assert_called_once_with(1)
 
-    @patch("slack_agent._slack_token", return_value="token-a")
     @patch("slack_agent._fetch_channels_from_slack", return_value=CHANNELS)
-    def test_fresh_cache_reuses_one_slack_fetch(self, fetch, _token):
-        first = slack_agent._fetch_visible_channels()
-        second = slack_agent._fetch_visible_channels()
+    def test_fresh_cache_reuses_one_slack_fetch(self, fetch):
+        first = slack_agent._fetch_visible_channels("token-a")
+        second = slack_agent._fetch_visible_channels("token-a")
 
         self.assertEqual(first, CHANNELS)
         self.assertEqual(second, CHANNELS)
         fetch.assert_called_once_with("token-a")
 
     @patch("slack_agent._fetch_channels_from_slack")
-    @patch("slack_agent._slack_token", side_effect=["token-a", "token-b"])
-    def test_cache_isolated_by_token_hash(self, _token, fetch):
+    def test_cache_isolated_by_token_hash(self, fetch):
         fetch.side_effect = lambda token: [
             {"name": token, "id": "C1", "is_private": False}
         ]
 
-        first = slack_agent._fetch_visible_channels()
-        second = slack_agent._fetch_visible_channels()
+        first = slack_agent._fetch_visible_channels("token-a")
+        second = slack_agent._fetch_visible_channels("token-b")
 
         self.assertEqual(first[0]["name"], "token-a")
         self.assertEqual(second[0]["name"], "token-b")
@@ -130,18 +261,16 @@ class FetchTests(unittest.TestCase):
         self.assertNotIn("token-a", slack_agent._CHANNEL_CACHE)
         self.assertNotIn("token-b", slack_agent._CHANNEL_CACHE)
 
-    @patch("slack_agent._slack_token", return_value="token-a")
     @patch("slack_agent._fetch_channels_from_slack", return_value=CHANNELS)
-    def test_cache_returns_defensive_copies(self, fetch, _token):
-        first = slack_agent._fetch_visible_channels()
+    def test_cache_returns_defensive_copies(self, fetch):
+        first = slack_agent._fetch_visible_channels("token-a")
         first[0]["name"] = "mutated"
 
-        second = slack_agent._fetch_visible_channels()
+        second = slack_agent._fetch_visible_channels("token-a")
 
         self.assertEqual(second[0]["name"], "eval-public")
         fetch.assert_called_once()
 
-    @patch("slack_agent._slack_token", return_value="token-a")
     @patch("slack_agent.time.monotonic", return_value=600.0)
     @patch(
         "slack_agent._fetch_channels_from_slack",
@@ -150,25 +279,24 @@ class FetchTests(unittest.TestCase):
             transient=True,
         ),
     )
-    def test_stale_cache_fallback_on_slack_error(self, fetch, _clock, _token):
+    def test_stale_cache_fallback_on_slack_error(self, fetch, _clock):
         key = slack_agent._cache_key("token-a")
         slack_agent._CHANNEL_CACHE[key] = slack_agent.ChannelCacheEntry(
             tuple(CHANNELS),
             fetched_at=0.0,
         )
 
-        result = slack_agent._fetch_visible_channels()
+        result = slack_agent._fetch_visible_channels("token-a")
 
         self.assertEqual(result, CHANNELS)
         fetch.assert_called_once_with("token-a")
 
-    @patch("slack_agent._slack_token", return_value="token-a")
     @patch("slack_agent.time.monotonic", return_value=600.0)
     @patch(
         "slack_agent._fetch_channels_from_slack",
         side_effect=slack_agent.ChannelFetchError("Slack API error: invalid_auth"),
     )
-    def test_stale_cache_not_used_for_auth_error(self, _fetch, _clock, _token):
+    def test_stale_cache_not_used_for_auth_error(self, _fetch, _clock):
         key = slack_agent._cache_key("token-a")
         slack_agent._CHANNEL_CACHE[key] = slack_agent.ChannelCacheEntry(
             tuple(CHANNELS),
@@ -176,11 +304,10 @@ class FetchTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(slack_agent.ChannelFetchError, "invalid_auth"):
-            slack_agent._fetch_visible_channels()
+            slack_agent._fetch_visible_channels("token-a")
 
-    @patch("slack_agent._slack_token", return_value="token-a")
     @patch("slack_agent._fetch_channels_from_slack")
-    def test_concurrent_misses_share_one_fetch(self, fetch, _token):
+    def test_concurrent_misses_share_one_fetch(self, fetch):
         started = threading.Event()
         release = threading.Event()
 
@@ -193,10 +320,14 @@ class FetchTests(unittest.TestCase):
         results = []
 
         first = threading.Thread(
-            target=lambda: results.append(slack_agent._fetch_visible_channels())
+            target=lambda: results.append(
+                slack_agent._fetch_visible_channels("token-a")
+            )
         )
         second = threading.Thread(
-            target=lambda: results.append(slack_agent._fetch_visible_channels())
+            target=lambda: results.append(
+                slack_agent._fetch_visible_channels("token-a")
+            )
         )
         first.start()
         started.wait(timeout=2)
@@ -217,11 +348,26 @@ class GraphTests(unittest.TestCase):
             slack_agent.private_channels_graph,
             slack_agent.eval_channels_graph,
             slack_agent.customer_channels_graph,
+            slack_agent.refresh_channels_graph,
         ]
 
         for graph in graphs:
             with self.subTest(graph=graph):
                 self.assertEqual(graph.get_input_jsonschema().get("properties"), {})
+
+    def test_agent_tool_schemas_do_not_expose_runtime_or_token(self):
+        tools = slack_agent.agent.nodes["tools"].bound.tools_by_name
+        slack_tools = {
+            "list_channels",
+            "list_eval_channels",
+            "list_customer_channels",
+            "list_public",
+            "list_private",
+            "refresh_channels",
+        }
+        for name in slack_tools:
+            with self.subTest(tool=name):
+                self.assertEqual(tools[name].args, {})
 
 
 if __name__ == "__main__":

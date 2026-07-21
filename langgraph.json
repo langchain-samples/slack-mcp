@@ -32,6 +32,10 @@
     "refresh_channels": {
       "path": "./slack_agent.py:refresh_channels_graph",
       "description": "Refresh the durable Slack channel snapshot for the authenticated caller."
+    },
+    "match_accounts_to_channels": {
+      "path": "./slack_agent.py:account_match_graph",
+      "description": "Match Salesforce account names to cached Slack channels with membership status."
     }
   },
   "env": ".env"

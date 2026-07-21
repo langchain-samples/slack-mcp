@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import threading
 import unittest
@@ -21,8 +22,18 @@ CHANNELS = [
     {"name": "eval-other", "id": "C2", "is_private": False, "is_member": False},
     {"name": "general", "id": "C3", "is_private": False, "is_member": True},
     {"name": "eval-private", "id": "G1", "is_private": True, "is_member": True},
-    {"name": "customer-public", "id": "C4", "is_private": False},
-    {"name": "customer-private", "id": "G2", "is_private": True},
+    {
+        "name": "customer-public",
+        "id": "C4",
+        "is_private": False,
+        "is_member": False,
+    },
+    {
+        "name": "customer-private",
+        "id": "G2",
+        "is_private": True,
+        "is_member": True,
+    },
 ]
 
 
@@ -60,6 +71,13 @@ class ChannelToolTests(unittest.TestCase):
         self.assertIn("Found 2 private channel(s)", private)
         self.assertIn("#eval-private", private)
         self.assertEqual(fetch.call_args_list[0].args, ("test-slack-token",))
+
+    @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
+    def test_listing_exposes_definitive_membership(self, _fetch):
+        result = slack_agent.list_customer_channels(runtime())
+
+        self.assertIn("[public, not-joined] #customer-public", result)
+        self.assertIn("[private, joined] #customer-private", result)
 
     @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
     def test_eval_filter_returns_all_visible_channels(self, _fetch):
@@ -201,11 +219,25 @@ class DurableSnapshotTests(unittest.TestCase):
         morgan_runtime = runtime(identity="T1:MORGAN", store=self.store)
         slack_agent._write_snapshot(
             liam_runtime,
-            [{"name": "eval-liam", "id": "C1", "is_private": False}],
+            [
+                {
+                    "name": "eval-liam",
+                    "id": "C1",
+                    "is_private": False,
+                    "is_member": True,
+                }
+            ],
         )
         slack_agent._write_snapshot(
             morgan_runtime,
-            [{"name": "eval-morgan", "id": "C2", "is_private": False}],
+            [
+                {
+                    "name": "eval-morgan",
+                    "id": "C2",
+                    "is_private": False,
+                    "is_member": True,
+                }
+            ],
         )
 
         liam = slack_agent.list_eval_channels(liam_runtime)
@@ -231,6 +263,50 @@ class DurableSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertNotIn("never-persist-this-token", repr(item.value))
         fetch.assert_called_once_with("never-persist-this-token")
+
+    def test_snapshot_is_minimized_searchable_jsonl(self):
+        caller = runtime(store=self.store)
+        source = [
+            {
+                "id": "C1",
+                "name": "customer-acme",
+                "is_private": False,
+                "is_member": False,
+                "topic": {"value": "must not persist"},
+            },
+            {
+                "id": "G1",
+                "name": "eval-acme",
+                "is_private": True,
+                "purpose": {"value": "must not persist"},
+            },
+        ]
+
+        slack_agent._write_snapshot(caller, source)
+        item = self.store.get(
+            (slack_agent.SNAPSHOT_NAMESPACE, "T1:U1"),
+            slack_agent.SNAPSHOT_STORE_KEY,
+        )
+        lines = item.value["content"].splitlines()
+
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(line.startswith("{") for line in lines))
+        self.assertNotIn("topic", item.value["content"])
+        self.assertNotIn("purpose", item.value["content"])
+        self.assertEqual(
+            slack_agent._read_snapshot(caller)[1]["is_member"],
+            True,
+        )
+
+    def test_legacy_json_snapshot_remains_readable(self):
+        caller = runtime(store=self.store)
+        self.store.put(
+            (slack_agent.SNAPSHOT_NAMESPACE, "T1:U1"),
+            slack_agent.LEGACY_SNAPSHOT_STORE_KEY,
+            slack_agent.create_file_data(json.dumps(CHANNELS)),
+        )
+
+        self.assertEqual(slack_agent._read_snapshot(caller), CHANNELS)
 
     @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
     def test_agent_filesystem_can_read_but_not_write_snapshot(self, _fetch):
@@ -258,6 +334,101 @@ class DurableSnapshotTests(unittest.TestCase):
 
         self.assertIn("#eval-public", result["result"])
         fetch.assert_not_called()
+
+
+class AccountMatchingTests(unittest.TestCase):
+    def setUp(self):
+        self.store = InMemoryStore()
+        self.caller = runtime(store=self.store)
+        slack_agent._write_snapshot(
+            self.caller,
+            [
+                {
+                    "id": "C1",
+                    "name": "customer-housecall-pro",
+                    "is_private": False,
+                    "is_member": False,
+                },
+                {
+                    "id": "G1",
+                    "name": "eval-cognite",
+                    "is_private": True,
+                    "is_member": True,
+                },
+                {
+                    "id": "C2",
+                    "name": "internal-oracle",
+                    "is_private": False,
+                    "is_member": True,
+                },
+                {
+                    "id": "C3",
+                    "name": "eval-harvey-ai",
+                    "is_private": False,
+                    "is_member": False,
+                },
+                {
+                    "id": "C4",
+                    "name": "customer-acme",
+                    "is_private": False,
+                    "is_member": False,
+                },
+                {
+                    "id": "G2",
+                    "name": "eval-acme",
+                    "is_private": True,
+                    "is_member": True,
+                },
+            ],
+        )
+
+    def test_matches_accounts_with_membership_and_all_supported_prefixes(self):
+        result = json.loads(
+            slack_agent.match_accounts_to_channels(
+                ["Housecall Pro, Inc.", "Cognite", "Oracle", "Missing Co"],
+                self.caller,
+            )
+        )["accounts"]
+
+        self.assertEqual(result[0]["status"], "matched")
+        self.assertEqual(result[0]["matches"][0]["is_member"], False)
+        self.assertEqual(result[1]["matches"][0]["visibility"], "private")
+        self.assertEqual(result[1]["matches"][0]["is_member"], True)
+        self.assertEqual(result[2]["matches"][0]["channel_name"], "internal-oracle")
+        self.assertEqual(result[3]["status"], "unmatched")
+
+    def test_ambiguous_exact_and_possible_matches_are_not_guessed(self):
+        result = json.loads(
+            slack_agent.match_accounts_to_channels(
+                ["Acme", "Harvey"], self.caller
+            )
+        )["accounts"]
+
+        self.assertEqual(result[0]["status"], "ambiguous")
+        self.assertEqual(len(result[0]["matches"]), 2)
+        self.assertEqual(result[1]["status"], "ambiguous")
+        self.assertEqual(result[1]["matches"][0]["match_type"], "possible")
+
+    def test_account_input_is_bounded(self):
+        too_many = ["account"] * (slack_agent.MAX_ACCOUNT_MATCH_INPUTS + 1)
+
+        result = json.loads(
+            slack_agent.match_accounts_to_channels(too_many, self.caller)
+        )
+
+        self.assertIn("error", result)
+
+    def test_direct_match_graph_has_bounded_structured_input(self):
+        graph = slack_agent._build_account_match_graph(store=self.store)
+
+        result = json.loads(
+            graph.invoke(
+                {"accounts": ["Cognite"]},
+                config=self.caller.config,
+            )["result"]
+        )
+
+        self.assertEqual(result["accounts"][0]["status"], "matched")
 
 
 class FetchTests(unittest.TestCase):
@@ -431,6 +602,16 @@ class GraphTests(unittest.TestCase):
         for name in slack_tools:
             with self.subTest(tool=name):
                 self.assertEqual(tools[name].args, {})
+
+        self.assertEqual(
+            set(tools["match_accounts_to_channels"].args),
+            {"accounts"},
+        )
+
+    def test_account_match_graph_exposes_only_accounts(self):
+        schema = slack_agent.account_match_graph.get_input_jsonschema()
+
+        self.assertEqual(set(schema["properties"]), {"accounts"})
 
 
 if __name__ == "__main__":

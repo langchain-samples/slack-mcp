@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -34,8 +36,34 @@ MAX_RETRY_DELAY_SECONDS = 5
 CACHE_TTL_SECONDS = 5 * 60
 STALE_CACHE_TTL_SECONDS = 60 * 60
 SNAPSHOT_NAMESPACE = "slack-channel-directory"
-SNAPSHOT_FILE_PATH = "/channels/directory.json"
-SNAPSHOT_STORE_KEY = "/directory.json"
+SNAPSHOT_FILE_PATH = "/channels/directory.jsonl"
+SNAPSHOT_STORE_KEY = "/directory.jsonl"
+LEGACY_SNAPSHOT_STORE_KEY = "/directory.json"
+MAX_ACCOUNT_MATCH_INPUTS = 200
+MAX_ACCOUNT_NAME_LENGTH = 200
+MAX_POSSIBLE_MATCHES = 10
+MATCH_CHANNEL_PREFIXES = (
+    "customer-",
+    "eval-",
+    "internal-",
+    "ext-",
+    "external-",
+    "langchain-",
+)
+COMPANY_SUFFIXES = {
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "group",
+    "holdings",
+    "inc",
+    "incorporated",
+    "limited",
+    "llc",
+    "ltd",
+    "plc",
+}
 
 MODEL_NAME = "claude-sonnet-4-6"
 MODEL_PROVIDER = "anthropic"
@@ -101,6 +129,16 @@ class ChannelToolState(EmptyInput, ChannelResult):
     """Internal state for a direct directory graph."""
 
 
+class AccountMatchInput(TypedDict):
+    """Bounded Salesforce account names to reconcile with Slack."""
+
+    accounts: list[str]
+
+
+class AccountMatchState(AccountMatchInput, ChannelResult):
+    """Internal state for the account-matching graph."""
+
+
 _CACHE_LOCK = threading.Lock()
 _CHANNEL_CACHE: dict[str, ChannelCacheEntry] = {}
 _FETCH_LOCKS: dict[str, threading.Lock] = {}
@@ -160,6 +198,36 @@ def _cache_key(token: str) -> str:
 def _copy_channels(channels: tuple[Channel, ...] | list[Channel]) -> list[Channel]:
     """Return a defensive deep copy of channel data."""
     return cast(list[Channel], deepcopy(list(channels)))
+
+
+def _channel_record(value: object) -> Channel | None:
+    """Reduce one Slack object to the non-sensitive fields this app needs."""
+    if not isinstance(value, Mapping):
+        return None
+    channel_id = value.get("id")
+    name = value.get("name")
+    if not isinstance(channel_id, str) or not isinstance(name, str):
+        return None
+    is_private = value.get("is_private") is True
+    is_member = value.get("is_member")
+    if not is_private and not isinstance(is_member, bool):
+        return None
+    return {
+        "id": channel_id,
+        "name": name,
+        "is_private": is_private,
+        "is_member": is_member if isinstance(is_member, bool) else True,
+    }
+
+
+def _normalized_channels(values: object) -> list[Channel] | None:
+    """Validate and minimize a decoded channel list."""
+    if not isinstance(values, list):
+        return None
+    channels = [_channel_record(value) for value in values]
+    if any(channel is None for channel in channels):
+        return None
+    return cast(list[Channel], channels)
 
 
 def _cached_channels(key: str, *, max_age: float) -> list[Channel] | None:
@@ -241,7 +309,10 @@ def _fetch_channels_from_slack(token: str) -> list[Channel]:
             continue
 
         retries = 0
-        channels.extend(cast(list[Channel], response.get("channels", [])))
+        page = _normalized_channels(response.get("channels", []))
+        if page is None:
+            raise ChannelFetchError("Slack API returned an invalid channel page.")
+        channels.extend(page)
         cursor = response.get("response_metadata", {}).get("next_cursor")
         if not cursor:
             return channels
@@ -274,10 +345,12 @@ def _read_snapshot(runtime: ToolRuntime) -> list[Channel] | None:
     """Read a durable channel snapshot without exposing credentials."""
     if runtime.store is None:
         return None
-    item = runtime.store.get(
-        _snapshot_namespace(runtime.config),
-        SNAPSHOT_STORE_KEY,
-    )
+    namespace = _snapshot_namespace(runtime.config)
+    item = runtime.store.get(namespace, SNAPSHOT_STORE_KEY)
+    legacy = False
+    if item is None:
+        item = runtime.store.get(namespace, LEGACY_SNAPSHOT_STORE_KEY)
+        legacy = item is not None
     if item is None:
         return None
     content = item.value.get("content")
@@ -286,26 +359,31 @@ def _read_snapshot(runtime: ToolRuntime) -> list[Channel] | None:
     if not isinstance(content, str):
         return None
     try:
-        channels = json.loads(content)
+        if legacy or content.lstrip().startswith("["):
+            decoded = json.loads(content)
+        else:
+            decoded = [json.loads(line) for line in content.splitlines() if line]
     except (TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(channels, list) or not all(
-        isinstance(channel, dict) for channel in channels
-    ):
-        return None
-    return _copy_channels(cast(list[Channel], channels))
+    channels = _normalized_channels(decoded)
+    return _copy_channels(channels) if channels is not None else None
 
 
 def _write_snapshot(runtime: ToolRuntime, channels: list[Channel]) -> None:
     """Persist only channel metadata in the caller's isolated namespace."""
     if runtime.store is None:
         return
+    minimized = _normalized_channels(channels)
+    if minimized is None:
+        raise ChannelFetchError("Refusing to persist invalid Slack channel data.")
+    content = "\n".join(
+        json.dumps(channel, sort_keys=True, separators=(",", ":"))
+        for channel in sorted(minimized, key=lambda item: item["name"])
+    )
     runtime.store.put(
         _snapshot_namespace(runtime.config),
         SNAPSHOT_STORE_KEY,
-        create_file_data(
-            json.dumps(_copy_channels(channels), separators=(",", ":"))
-        ),
+        create_file_data(content),
         index=False,
     )
 
@@ -333,7 +411,8 @@ def _format_channels(channels: list[Channel], label: str) -> str:
         key=lambda c: (c.get("is_private", False), c.get("name", "")),
     )
     lines = [
-        f"[{'private' if c.get('is_private', False) else 'public'}] "
+        f"[{'private' if c.get('is_private', False) else 'public'}, "
+        f"{'joined' if c.get('is_member', False) else 'not-joined'}] "
         f"#{c.get('name', 'unknown')} ({c.get('id', 'unknown')})"
         for c in ordered
     ]
@@ -447,6 +526,129 @@ def refresh_channels(runtime: ToolRuntime) -> str:
     return f"Refreshed the durable snapshot with {len(channels)} channel(s)."
 
 
+def _slug(value: str) -> str:
+    """Create a deterministic Slack-style slug from an account or channel name."""
+    ascii_value = (
+        unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    )
+    return re.sub(
+        r"-+",
+        "-",
+        re.sub(r"[^a-z0-9]+", "-", ascii_value.lower()),
+    ).strip("-")
+
+
+def _account_slugs(account: str) -> set[str]:
+    """Return conservative exact-match variants for one Salesforce account."""
+    slug = _slug(account)
+    variants = {slug} if slug else set()
+    parts = slug.split("-")
+    while len(parts) > 1 and parts[-1] in COMPANY_SUFFIXES:
+        parts.pop()
+        variants.add("-".join(parts))
+    return variants
+
+
+def _channel_prefix(name: str) -> str | None:
+    return next(
+        (prefix for prefix in MATCH_CHANNEL_PREFIXES if name.startswith(prefix)),
+        None,
+    )
+
+
+def _match_payload(channel: Channel, match_type: str) -> dict[str, object]:
+    return {
+        "channel_id": channel["id"],
+        "channel_name": channel["name"],
+        "is_member": channel["is_member"],
+        "match_type": match_type,
+        "visibility": "private" if channel["is_private"] else "public",
+    }
+
+
+def _match_one_account(account: str, channels: list[Channel]) -> dict[str, object]:
+    variants = _account_slugs(account)
+    exact: list[Channel] = []
+    possible: list[Channel] = []
+    for channel in channels:
+        name = channel["name"]
+        prefix = _channel_prefix(name)
+        if prefix is None:
+            continue
+        suffix = name[len(prefix) :]
+        if suffix in variants:
+            exact.append(channel)
+        elif any(
+            len(variant) >= 4
+            and len(suffix) >= 4
+            and (variant in suffix or suffix in variant)
+            for variant in variants
+        ):
+            possible.append(channel)
+
+    if len(exact) == 1:
+        return {
+            "account": account,
+            "matches": [_match_payload(exact[0], "exact")],
+            "status": "matched",
+        }
+    if exact:
+        matches = [_match_payload(channel, "exact") for channel in exact]
+    else:
+        matches = [
+            _match_payload(channel, "possible")
+            for channel in possible[:MAX_POSSIBLE_MATCHES]
+        ]
+    return {
+        "account": account,
+        "matches": matches,
+        "status": "ambiguous" if matches else "unmatched",
+        **(
+            {"matches_truncated": True}
+            if not exact and len(possible) > MAX_POSSIBLE_MATCHES
+            else {}
+        ),
+    }
+
+
+def match_accounts_to_channels(accounts: list[str], runtime: ToolRuntime) -> str:
+    """Deterministically match Salesforce accounts to cached Slack channels."""
+    if not accounts or len(accounts) > MAX_ACCOUNT_MATCH_INPUTS:
+        return json.dumps(
+            {
+                "error": (
+                    f"Provide between 1 and {MAX_ACCOUNT_MATCH_INPUTS} account names."
+                )
+            }
+        )
+    if any(
+        not isinstance(account, str)
+        or not account.strip()
+        or len(account) > MAX_ACCOUNT_NAME_LENGTH
+        for account in accounts
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    "Every account must be a non-empty string no longer than "
+                    f"{MAX_ACCOUNT_NAME_LENGTH} characters."
+                )
+            }
+        )
+    try:
+        channels = _directory_channels(runtime)
+    except (ChannelFetchError, SnapshotMissingError) as error:
+        return json.dumps({"error": str(error)})
+    return json.dumps(
+        {
+            "accounts": [
+                _match_one_account(account.strip(), channels) for account in accounts
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+
 def _build_directory_graph(
     tool: Callable[[ToolRuntime], str],
     *,
@@ -480,12 +682,44 @@ def _build_directory_graph(
     return builder.compile(store=store)
 
 
+def _build_account_match_graph(*, store: BaseStore | None = None):
+    """Build the bounded structured Salesforce-to-Slack matching graph."""
+
+    def run(
+        state: AccountMatchInput,
+        config: RunnableConfig,
+        store: BaseStore,
+    ) -> ChannelResult:
+        runtime = ToolRuntime(
+            state=state,
+            context=None,
+            config=config,
+            stream_writer=lambda _: None,
+            tool_call_id=None,
+            store=store,
+        )
+        return {
+            "result": match_accounts_to_channels(state["accounts"], runtime),
+        }
+
+    builder = StateGraph(
+        AccountMatchState,
+        input_schema=AccountMatchInput,
+        output_schema=ChannelResult,
+    )
+    builder.add_node("run", run)
+    builder.add_edge(START, "run")
+    builder.add_edge("run", END)
+    return builder.compile(store=store)
+
+
 all_channels_graph = _build_directory_graph(list_channels)
 public_channels_graph = _build_directory_graph(list_public)
 private_channels_graph = _build_directory_graph(list_private)
 eval_channels_graph = _build_directory_graph(list_eval_channels)
 customer_channels_graph = _build_directory_graph(list_customer_channels)
 refresh_channels_graph = _build_directory_graph(refresh_channels)
+account_match_graph = _build_account_match_graph()
 
 
 def _gateway_api_key() -> str:
@@ -530,21 +764,24 @@ agent = create_deep_agent(
         list_public,
         list_private,
         refresh_channels,
+        match_accounts_to_channels,
     ],
     system_prompt=(
         "You are a Slack assistant. For questions about eval channels, always call "
         "list_eval_channels. For questions about customer channels, always call "
         "list_customer_channels. For public-only channel requests, call list_public. "
-        "For private-only channel requests, call list_private. For general channel "
-        "listing or membership questions, call list_channels. Only call "
+        "For private-only channel requests, call list_private. For Salesforce "
+        "account reconciliation, always call match_accounts_to_channels instead of "
+        "loading or fuzzy-matching the full directory. For general channel listing "
+        "or membership questions, call list_channels. Only call "
         "refresh_channels when the user explicitly asks to refresh or update the "
         "saved directory. Answer only from tool "
-        "results or the caller's /channels/directory.json file. The channel "
+        "results or the caller's /channels/directory.jsonl file. The channel "
         "filesystem is read-only and isolated to the authenticated Slack user. "
         "Never ask for, reveal, or repeat credentials. Do not invent channels or "
         "IDs."
     ),
 )
 
-# Keep the existing deployment export name while exposing the create_agent graph.
+# Keep the existing deployment export name while exposing the Deep Agent graph.
 graph = agent

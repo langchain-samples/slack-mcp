@@ -5,7 +5,7 @@ endpoint. The agent uses `claude-sonnet-4-6` through LangSmith Gateway and can
 list the private channels visible to the authenticated Slack identity, along
 with all visible public channels.
 
-The agent has six Slack tools:
+The agent has seven Slack tools:
 
 - `list_channels`: all visible public and accessible private channels.
 - `list_eval_channels`: every visible public and private `eval-` channel.
@@ -13,6 +13,8 @@ The agent has six Slack tools:
 - `list_public`: all active public channels visible to the Slack identity.
 - `list_private`: all active private channels accessible to the Slack identity.
 - `refresh_channels`: replace the caller's durable snapshot from Slack.
+- `match_accounts_to_channels`: deterministically reconcile up to 200 Salesforce
+  account names with cached Slack channels and membership.
 
 ## Local setup
 
@@ -55,7 +57,7 @@ Custom authentication validates the LangSmith key against the LangSmith API and
 the Slack token against Slack, then makes the Slack token available only as
 request metadata. That authenticated Slack identity selects a private durable
 filesystem namespace; Liam and Morgan therefore read different
-`/channels/directory.json` files without putting either name in a caller-
+`/channels/directory.jsonl` files without putting either name in a caller-
 controlled tool argument. Channel results reflect the caller's own visibility.
 The Slack token is never written to the filesystem or placed in graph state,
 model messages, tool results, or application logs.
@@ -106,7 +108,7 @@ with the values above.
 
 The first list request does not perform a slow Slack scan automatically. Ask the
 agent to call `refresh_channels` once to create the authenticated user's durable
-`/channels/directory.json` file. The initial refresh can take approximately
+`/channels/directory.jsonl` file. The initial refresh can take approximately
 15–20 seconds for a large workspace.
 
 After that refresh, normal tools read the durable file and typically return in
@@ -117,9 +119,24 @@ under a second:
 - `list_public`
 - `list_private`
 - `list_channels`
+- `match_accounts_to_channels`
 
 Run `refresh_channels` again whenever the user wants the saved directory updated.
 Refreshing one user never changes another user's file.
+
+For Salesforce reconciliation, pass the relevant account names directly to
+`match_accounts_to_channels` instead of loading the entire Slack directory. The
+tool searches `customer-`, `eval-`, `internal-`, `ext-`, `external-`, and
+`langchain-` channels and returns compact structured results:
+
+- `matched`: one deterministic exact normalized match.
+- `ambiguous`: multiple exact matches or bounded possible matches requiring
+  review.
+- `unmatched`: no candidate channel.
+
+Every match includes `channel_id`, `channel_name`, `visibility`, and the
+definitive `is_member` value for the authenticated Slack user. The tool does not
+use an LLM for fuzzy matching and accepts at most 200 accounts per call.
 
 Suggested verification requests:
 
@@ -151,6 +168,8 @@ Every directory operation is also exposed as a direct, argument-free MCP tool:
 - `list_eval_channels`
 - `list_customer_channels`
 - `refresh_channels`
+- `match_accounts_to_channels` (accepts `accounts`; all other direct tools are
+  argument-free)
 
 These tools bypass Claude. List operations read a durable, user-isolated Deep
 Agents virtual file backed by LangGraph Store, which survives deployment
@@ -159,5 +178,7 @@ search this file but cannot modify it. If the file is missing, list tools return
 immediately with an instruction to run `refresh_channels`; they never silently
 fall through to a slow Slack scan. `refresh_channels` creates or replaces the
 snapshot. The store contains channel metadata only—never either
-credential. A lightweight five-minute process cache still collapses concurrent
+credential. The file uses JSONL with one minimized channel record per line, so
+Deep Agent `grep` calls return individual channels instead of a multi-megabyte
+single line. A lightweight five-minute process cache still collapses concurrent
 cold misses, with a one-hour stale fallback during temporary Slack rate limits.

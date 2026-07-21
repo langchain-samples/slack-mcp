@@ -2,6 +2,7 @@ import importlib
 import os
 import threading
 import unittest
+from collections import UserDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -107,6 +108,43 @@ class ChannelToolTests(unittest.TestCase):
     def test_missing_request_credentials_fail_without_secret_details(self):
         with self.assertRaisesRegex(RuntimeError, "credentials are unavailable"):
             slack_agent.list_channels(SimpleNamespace(config={}, store=None))
+
+    def test_auth_user_mapping_shape_is_supported(self):
+        request_config = {
+            "configurable": {
+                "langgraph_auth_user": UserDict(
+                    {"identity": "T1:U1", "slack_token": "request-token"}
+                )
+            }
+        }
+
+        self.assertEqual(
+            slack_agent._identity_from_config(request_config),
+            "T1:U1",
+        )
+        self.assertEqual(
+            slack_agent._slack_token_from_config(request_config),
+            "request-token",
+        )
+
+    def test_auth_user_object_shape_is_supported(self):
+        request_config = {
+            "configurable": {
+                "langgraph_auth_user": SimpleNamespace(
+                    identity="T1:U1",
+                    slack_token="request-token",
+                )
+            }
+        }
+
+        self.assertEqual(
+            slack_agent._identity_from_config(request_config),
+            "T1:U1",
+        )
+        self.assertEqual(
+            slack_agent._slack_token_from_config(request_config),
+            "request-token",
+        )
 
 
 class DurableSnapshotTests(unittest.TestCase):

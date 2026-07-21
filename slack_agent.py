@@ -7,7 +7,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import cast
@@ -105,10 +105,17 @@ _CHANNEL_CACHE: dict[str, ChannelCacheEntry] = {}
 _FETCH_LOCKS: dict[str, threading.Lock] = {}
 
 
+def _auth_user_field(config: RunnableConfig, field: str) -> object:
+    """Read one field from LangGraph's mapping- or object-shaped auth user."""
+    user = config.get("configurable", {}).get("langgraph_auth_user")
+    if isinstance(user, Mapping):
+        return user.get(field)
+    return getattr(user, field, None)
+
+
 def _slack_token_from_config(config: RunnableConfig) -> str:
     """Read the authenticated Slack token from request-scoped metadata."""
-    user = config.get("configurable", {}).get("langgraph_auth_user")
-    token = user.get("slack_token") if isinstance(user, dict) else None
+    token = _auth_user_field(config, "slack_token")
     if not isinstance(token, str) or not token:
         raise RuntimeError("Authenticated Slack credentials are unavailable.")
     return token
@@ -116,8 +123,7 @@ def _slack_token_from_config(config: RunnableConfig) -> str:
 
 def _identity_from_config(config: RunnableConfig) -> str:
     """Read the stable identity produced by request authentication."""
-    user = config.get("configurable", {}).get("langgraph_auth_user")
-    identity = user.get("identity") if isinstance(user, dict) else None
+    identity = _auth_user_field(config, "identity")
     if not isinstance(identity, str) or not identity:
         raise RuntimeError("Authenticated Slack identity is unavailable.")
     return identity

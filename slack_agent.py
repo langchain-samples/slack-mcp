@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable
-from typing import TypedDict, cast
+from typing import cast
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
+from langgraph.graph import END, START, StateGraph
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from typing_extensions import TypedDict
 
 CHANNEL_TYPES = "public_channel,private_channel"
 PAGE_SIZE = 999
@@ -34,6 +36,20 @@ class Channel(TypedDict, total=False):
 
 class ChannelFetchError(RuntimeError):
     """A safe, user-facing Slack channel fetch error."""
+
+
+class EmptyInput(TypedDict):
+    """Direct directory graphs accept no caller-controlled input."""
+
+
+class ChannelResult(TypedDict):
+    """Direct directory graph output."""
+
+    result: str
+
+
+class ChannelToolState(EmptyInput, ChannelResult):
+    """Internal state for a direct directory graph."""
 
 
 def _slack_client() -> WebClient:
@@ -115,10 +131,12 @@ def _all_channels(_: Channel) -> bool:
     return True
 
 
-def _is_eval_member(channel: Channel) -> bool:
-    return channel.get("name", "").startswith("eval-") and channel.get(
-        "is_member", False
-    )
+def _has_eval_prefix(channel: Channel) -> bool:
+    return channel.get("name", "").startswith("eval-")
+
+
+def _has_customer_prefix(channel: Channel) -> bool:
+    return channel.get("name", "").startswith("customer-")
 
 
 def _is_public(channel: Channel) -> bool:
@@ -160,11 +178,20 @@ def list_channels() -> str:
 
 
 def list_eval_channels() -> str:
-    """List joined public/private Slack channels whose names start with `eval-`."""
+    """List every visible public/private Slack channel named `eval-*`."""
     return _channel_response(
-        _is_eval_member,
+        _has_eval_prefix,
         label="eval- channel(s)",
-        empty_message="No active eval- channels found for this Slack identity.",
+        empty_message="No active visible eval- channels found.",
+    )
+
+
+def list_customer_channels() -> str:
+    """List every visible public/private Slack channel named `customer-*`."""
+    return _channel_response(
+        _has_customer_prefix,
+        label="customer- channel(s)",
+        empty_message="No active visible customer- channels found.",
     )
 
 
@@ -184,6 +211,27 @@ def list_private() -> str:
         label="private channel(s)",
         empty_message="No active private channels are visible to this Slack identity.",
     )
+
+
+def _build_directory_graph(tool: Callable[[], str]):
+    """Build a direct MCP graph around one deterministic directory tool."""
+
+    def run(_: EmptyInput) -> ChannelResult:
+        return {"result": tool()}
+
+    builder = StateGraph(
+        ChannelToolState,
+        input_schema=EmptyInput,
+        output_schema=ChannelResult,
+    )
+    builder.add_node("run", run)
+    builder.add_edge(START, "run")
+    builder.add_edge("run", END)
+    return builder.compile()
+
+
+eval_channels_graph = _build_directory_graph(list_eval_channels)
+customer_channels_graph = _build_directory_graph(list_customer_channels)
 
 
 def _gateway_api_key() -> str:
@@ -206,11 +254,18 @@ model = init_chat_model(
 
 agent = create_agent(
     model=model,
-    tools=[list_channels, list_eval_channels, list_public, list_private],
+    tools=[
+        list_channels,
+        list_eval_channels,
+        list_customer_channels,
+        list_public,
+        list_private,
+    ],
     system_prompt=(
         "You are a Slack assistant. For questions about eval channels, always call "
-        "list_eval_channels. For public-only channel requests, call list_public. For "
-        "private-only channel requests, call list_private. For general channel "
+        "list_eval_channels. For questions about customer channels, always call "
+        "list_customer_channels. For public-only channel requests, call list_public. "
+        "For private-only channel requests, call list_private. For general channel "
         "listing or membership questions, call list_channels. Answer only from tool "
         "results. Never ask for, reveal, or repeat credentials. Do not invent "
         "channels or IDs."

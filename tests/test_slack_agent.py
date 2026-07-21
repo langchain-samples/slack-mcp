@@ -17,6 +17,8 @@ CHANNELS = [
     {"name": "eval-other", "id": "C2", "is_private": False, "is_member": False},
     {"name": "general", "id": "C3", "is_private": False, "is_member": True},
     {"name": "eval-private", "id": "G1", "is_private": True, "is_member": True},
+    {"name": "customer-public", "id": "C4", "is_private": False},
+    {"name": "customer-private", "id": "G2", "is_private": True},
 ]
 
 
@@ -26,19 +28,27 @@ class ChannelToolTests(unittest.TestCase):
         public = slack_agent.list_public()
         private = slack_agent.list_private()
 
-        self.assertIn("Found 3 public channel(s)", public)
+        self.assertIn("Found 4 public channel(s)", public)
         self.assertNotIn("#eval-private", public)
-        self.assertIn("Found 1 private channel(s)", private)
+        self.assertIn("Found 2 private channel(s)", private)
         self.assertIn("#eval-private", private)
 
     @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
-    def test_eval_filter_requires_membership(self, _fetch):
+    def test_eval_filter_returns_all_visible_channels(self, _fetch):
         result = slack_agent.list_eval_channels()
 
-        self.assertIn("Found 2 eval- channel(s)", result)
+        self.assertIn("Found 3 eval- channel(s)", result)
         self.assertIn("#eval-public", result)
         self.assertIn("#eval-private", result)
-        self.assertNotIn("#eval-other", result)
+        self.assertIn("#eval-other", result)
+
+    @patch("slack_agent._fetch_visible_channels", return_value=CHANNELS)
+    def test_customer_filter_returns_all_visible_channels(self, _fetch):
+        result = slack_agent.list_customer_channels()
+
+        self.assertIn("Found 2 customer- channel(s)", result)
+        self.assertIn("#customer-public", result)
+        self.assertIn("#customer-private", result)
 
     @patch(
         "slack_agent._fetch_visible_channels",
@@ -46,6 +56,11 @@ class ChannelToolTests(unittest.TestCase):
     )
     def test_safe_fetch_error_is_returned(self, _fetch):
         self.assertEqual(slack_agent.list_channels(), "Slack API error: test")
+
+    def test_direct_directory_graph_returns_tool_result(self):
+        graph = slack_agent._build_directory_graph(lambda: "directory-result")
+
+        self.assertEqual(graph.invoke({}), {"result": "directory-result"})
 
 
 class FetchTests(unittest.TestCase):

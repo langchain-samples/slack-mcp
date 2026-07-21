@@ -8,8 +8,8 @@ configured Slack identity, along with all visible public channels.
 The agent has four Slack tools:
 
 - `list_channels`: all visible public and accessible private channels.
-- `list_eval_channels`: only active `eval-` channels where the Slack identity is
-  a member, across both public and private channels.
+- `list_eval_channels`: every visible public and private `eval-` channel.
+- `list_customer_channels`: every visible public and private `customer-` channel.
 - `list_public`: all active public channels visible to the Slack identity.
 - `list_private`: all active private channels accessible to the Slack identity.
 
@@ -53,3 +53,7 @@ all public and accessible private channels visible to the shared Slack identity.
 
 Because this is a model-backed agent, Slack tool results are sent to
 Claude through LangSmith Gateway so the model can compose its response.
+
+For bulk `eval-` and `customer-` queries, the deployment also exposes direct
+MCP tools named `list_eval_channels` and `list_customer_channels`. They do not
+invoke Claude and accept no arguments.

@@ -4,7 +4,15 @@
   "graphs": {
     "list_private_slack_channels": {
       "path": "./slack_agent.py:graph",
-      "description": "A Slack assistant that uses Claude through LangSmith Gateway with tools for all visible channels, public channels, accessible private channels, and joined public/private eval- channels."
+      "description": "A Slack assistant that uses Claude through LangSmith Gateway with tools for visible, public, private, eval-, and customer- channels."
+    },
+    "list_eval_channels": {
+      "path": "./slack_agent.py:eval_channels_graph",
+      "description": "List every visible public and private Slack channel whose name starts with eval-."
+    },
+    "list_customer_channels": {
+      "path": "./slack_agent.py:customer_channels_graph",
+      "description": "List every visible public and private Slack channel whose name starts with customer-."
     }
   },
   "env": ".env"

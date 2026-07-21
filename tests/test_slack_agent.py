@@ -9,6 +9,7 @@ from unittest.mock import patch
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.slack_response import SlackResponse
 from langgraph.store.memory import InMemoryStore
+from langgraph.runtime import Runtime, ServerInfo
 
 os.environ.setdefault("LANGSMITH_API_GATEWAY_TOKEN", "test-gateway-token")
 
@@ -144,6 +145,30 @@ class ChannelToolTests(unittest.TestCase):
         self.assertEqual(
             slack_agent._slack_token_from_config(request_config),
             "request-token",
+        )
+
+    @patch("slack_agent.get_runtime")
+    def test_hosted_server_user_supplies_auth_fields(self, runtime_getter):
+        runtime_getter.return_value = Runtime(
+            server_info=ServerInfo(
+                assistant_id="assistant-id",
+                graph_id="graph-id",
+                user=UserDict(
+                    {
+                        "identity": "T1:HOSTED",
+                        "slack_token": "hosted-request-token",
+                    }
+                ),
+            )
+        )
+
+        self.assertEqual(
+            slack_agent._identity_from_config({}),
+            "T1:HOSTED",
+        )
+        self.assertEqual(
+            slack_agent._slack_token_from_config({}),
+            "hosted-request-token",
         )
 
 

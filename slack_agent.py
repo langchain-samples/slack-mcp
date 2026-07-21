@@ -20,6 +20,7 @@ from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from deepagents.backends.protocol import EditResult, WriteResult
 from deepagents.backends.utils import create_file_data
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import get_runtime
 from langgraph.store.base import BaseStore
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -107,10 +108,22 @@ _FETCH_LOCKS: dict[str, threading.Lock] = {}
 
 def _auth_user_field(config: RunnableConfig, field: str) -> object:
     """Read one field from LangGraph's mapping- or object-shaped auth user."""
-    user = config.get("configurable", {}).get("langgraph_auth_user")
+    try:
+        server_info = get_runtime().server_info
+    except RuntimeError:
+        server_info = None
+    user = server_info.user if server_info is not None else None
+    if user is None:
+        user = config.get("configurable", {}).get("langgraph_auth_user")
     if isinstance(user, Mapping):
         return user.get(field)
-    return getattr(user, field, None)
+    value = getattr(user, field, None)
+    if value is not None:
+        return value
+    try:
+        return user[field]
+    except (KeyError, TypeError):
+        return None
 
 
 def _slack_token_from_config(config: RunnableConfig) -> str:

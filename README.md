@@ -27,8 +27,9 @@ LANGSMITH_API_KEY_GATEWAY=<gateway-user-service-key>
 ```
 
 `SLACK_USER_TOKEN` must have `channels:read` and `groups:read`. The Gateway key
-must use the `gateway-user` role. The code also accepts the legacy local names
-`SLACK_TOKEN` and `LANGSMITH_API_GATEWAY_TOKEN`.
+must use the `gateway-user` role. `LANGSMITH_API_KEY_GATEWAY` is the only
+supported Gateway credential name; `SLACK_TOKEN` remains a local Slack-token
+fallback.
 
 Invoke the agent locally:
 

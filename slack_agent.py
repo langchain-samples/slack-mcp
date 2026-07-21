@@ -188,9 +188,7 @@ def list_private() -> str:
 
 def _gateway_api_key() -> str:
     """Read the LangSmith Gateway service key without logging it."""
-    api_key = os.environ.get("LANGSMITH_API_KEY_GATEWAY") or os.environ.get(
-        "LANGSMITH_API_GATEWAY_TOKEN"
-    )
+    api_key = os.environ.get("LANGSMITH_API_KEY_GATEWAY")
     if not api_key:
         raise RuntimeError(
             "LANGSMITH_API_KEY_GATEWAY is not set. Configure a gateway-user "

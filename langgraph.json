@@ -6,6 +6,18 @@
       "path": "./slack_agent.py:graph",
       "description": "A Slack assistant that uses Claude through LangSmith Gateway with tools for visible, public, private, eval-, and customer- channels."
     },
+    "list_channels": {
+      "path": "./slack_agent.py:all_channels_graph",
+      "description": "List every active public and accessible private Slack channel visible to the configured identity."
+    },
+    "list_public": {
+      "path": "./slack_agent.py:public_channels_graph",
+      "description": "List every active public Slack channel visible to the configured identity."
+    },
+    "list_private": {
+      "path": "./slack_agent.py:private_channels_graph",
+      "description": "List every active private Slack channel accessible to the configured identity."
+    },
     "list_eval_channels": {
       "path": "./slack_agent.py:eval_channels_graph",
       "description": "List every visible public and private Slack channel whose name starts with eval-."

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import cast
 
 from langchain.agents import create_agent
@@ -16,9 +20,11 @@ from typing_extensions import TypedDict
 
 CHANNEL_TYPES = "public_channel,private_channel"
 PAGE_SIZE = 999
-MAX_RATE_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_RETRIES = 1
 MIN_RETRY_DELAY_SECONDS = 1
-MAX_RETRY_DELAY_SECONDS = 30
+MAX_RETRY_DELAY_SECONDS = 5
+CACHE_TTL_SECONDS = 5 * 60
+STALE_CACHE_TTL_SECONDS = 60 * 60
 
 MODEL_NAME = "claude-sonnet-4-6"
 MODEL_PROVIDER = "anthropic"
@@ -37,6 +43,18 @@ class Channel(TypedDict, total=False):
 class ChannelFetchError(RuntimeError):
     """A safe, user-facing Slack channel fetch error."""
 
+    def __init__(self, message: str, *, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
+
+
+@dataclass(frozen=True)
+class ChannelCacheEntry:
+    """One immutable-by-convention cached Slack directory snapshot."""
+
+    channels: tuple[Channel, ...]
+    fetched_at: float
+
 
 class EmptyInput(TypedDict):
     """Direct directory graphs accept no caller-controlled input."""
@@ -52,15 +70,74 @@ class ChannelToolState(EmptyInput, ChannelResult):
     """Internal state for a direct directory graph."""
 
 
-def _slack_client() -> WebClient:
-    """Build a Slack client from an environment-provided token."""
+_CACHE_LOCK = threading.Lock()
+_CHANNEL_CACHE: dict[str, ChannelCacheEntry] = {}
+_FETCH_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _slack_token() -> str:
+    """Read the Slack token without logging or retaining it."""
     token = os.environ.get("SLACK_USER_TOKEN") or os.environ.get("SLACK_TOKEN")
     if not token:
         raise RuntimeError(
             "SLACK_USER_TOKEN is not set. Export a Slack OAuth token with the "
             "'channels:read' and 'groups:read' scopes."
         )
+    return token
+
+
+def _slack_client(token: str) -> WebClient:
+    """Build a Slack client for one request-scoped token."""
     return WebClient(token=token)
+
+
+def _cache_key(token: str) -> str:
+    """Derive a non-reversible cache key from a Slack token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _copy_channels(channels: tuple[Channel, ...] | list[Channel]) -> list[Channel]:
+    """Return a defensive deep copy of channel data."""
+    return cast(list[Channel], deepcopy(list(channels)))
+
+
+def _cached_channels(key: str, *, max_age: float) -> list[Channel] | None:
+    """Return a defensive copy of a cache entry within `max_age`."""
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        entry = _CHANNEL_CACHE.get(key)
+        if entry is None or now - entry.fetched_at > max_age:
+            return None
+    return _copy_channels(entry.channels)
+
+
+def _store_channels(key: str, channels: list[Channel]) -> list[Channel]:
+    """Store a defensive snapshot and prune expired entries."""
+    now = time.monotonic()
+    entry = ChannelCacheEntry(tuple(_copy_channels(channels)), now)
+    with _CACHE_LOCK:
+        expired = [
+            cache_key
+            for cache_key, cached in _CHANNEL_CACHE.items()
+            if now - cached.fetched_at > STALE_CACHE_TTL_SECONDS
+        ]
+        for cache_key in expired:
+            _CHANNEL_CACHE.pop(cache_key, None)
+        _CHANNEL_CACHE[key] = entry
+    return _copy_channels(entry.channels)
+
+
+def _fetch_lock(key: str) -> threading.Lock:
+    """Return the per-token lock used to collapse concurrent cache misses."""
+    with _CACHE_LOCK:
+        return _FETCH_LOCKS.setdefault(key, threading.Lock())
+
+
+def _clear_channel_cache() -> None:
+    """Clear process-local cache state; intended for tests and maintenance."""
+    with _CACHE_LOCK:
+        _CHANNEL_CACHE.clear()
+        _FETCH_LOCKS.clear()
 
 
 def _retry_delay(error: SlackApiError) -> int:
@@ -72,9 +149,9 @@ def _retry_delay(error: SlackApiError) -> int:
     return max(MIN_RETRY_DELAY_SECONDS, min(delay, MAX_RETRY_DELAY_SECONDS))
 
 
-def _fetch_visible_channels() -> list[Channel]:
-    """Fetch all visible public/private channels with bounded retries."""
-    client = _slack_client()
+def _fetch_channels_from_slack(token: str) -> list[Channel]:
+    """Fetch the complete visible channel directory from Slack."""
+    client = _slack_client(token)
     channels: list[Channel] = []
     cursor: str | None = None
     retries = 0
@@ -95,7 +172,8 @@ def _fetch_visible_channels() -> list[Channel]:
             retries += 1
             if retries > MAX_RATE_LIMIT_RETRIES:
                 raise ChannelFetchError(
-                    f"Slack API error: ratelimited after {MAX_RATE_LIMIT_RETRIES} retries"
+                    f"Slack API error: ratelimited after {MAX_RATE_LIMIT_RETRIES} retries",
+                    transient=True,
                 ) from error
 
             time.sleep(_retry_delay(error))
@@ -106,6 +184,30 @@ def _fetch_visible_channels() -> list[Channel]:
         cursor = response.get("response_metadata", {}).get("next_cursor")
         if not cursor:
             return channels
+
+
+def _fetch_visible_channels() -> list[Channel]:
+    """Return a cached directory, collapsing concurrent misses per token."""
+    token = _slack_token()
+    key = _cache_key(token)
+
+    fresh = _cached_channels(key, max_age=CACHE_TTL_SECONDS)
+    if fresh is not None:
+        return fresh
+
+    with _fetch_lock(key):
+        fresh = _cached_channels(key, max_age=CACHE_TTL_SECONDS)
+        if fresh is not None:
+            return fresh
+
+        stale = _cached_channels(key, max_age=STALE_CACHE_TTL_SECONDS)
+        try:
+            channels = _fetch_channels_from_slack(token)
+        except ChannelFetchError as error:
+            if error.transient and stale is not None:
+                return stale
+            raise
+        return _store_channels(key, channels)
 
 
 def _format_channels(channels: list[Channel], label: str) -> str:
@@ -230,6 +332,9 @@ def _build_directory_graph(tool: Callable[[], str]):
     return builder.compile()
 
 
+all_channels_graph = _build_directory_graph(list_channels)
+public_channels_graph = _build_directory_graph(list_public)
+private_channels_graph = _build_directory_graph(list_private)
 eval_channels_graph = _build_directory_graph(list_eval_channels)
 customer_channels_graph = _build_directory_graph(list_customer_channels)
 

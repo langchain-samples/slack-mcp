@@ -5,7 +5,7 @@ Deployment MCP endpoint. The agent uses `claude-sonnet-4-6` through LangSmith
 Gateway and can call Slack to list the private channels visible to the
 configured Slack identity, along with all visible public channels.
 
-The agent has four Slack tools:
+The agent has five Slack tools:
 
 - `list_channels`: all visible public and accessible private channels.
 - `list_eval_channels`: every visible public and private `eval-` channel.
@@ -54,6 +54,16 @@ all public and accessible private channels visible to the shared Slack identity.
 Because this is a model-backed agent, Slack tool results are sent to
 Claude through LangSmith Gateway so the model can compose its response.
 
-For bulk `eval-` and `customer-` queries, the deployment also exposes direct
-MCP tools named `list_eval_channels` and `list_customer_channels`. They do not
-invoke Claude and accept no arguments.
+Every directory operation is also exposed as a direct, argument-free MCP tool:
+
+- `list_channels`
+- `list_public`
+- `list_private`
+- `list_eval_channels`
+- `list_customer_channels`
+
+These tools bypass Claude. A lightweight five-minute per-token cache only
+protects retries and back-to-back queries; it is not intended as persistent
+storage. Concurrent cache misses share one Slack fetch, and a snapshot remains
+available as a one-hour stale fallback during temporary Slack rate limits. Each
+deployment replica warms independently.

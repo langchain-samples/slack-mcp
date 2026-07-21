@@ -126,17 +126,22 @@ Refreshing one user never changes another user's file.
 
 For Salesforce reconciliation, pass the relevant account names directly to
 `match_accounts_to_channels` instead of loading the entire Slack directory. The
-tool searches `customer-`, `eval-`, `internal-`, `ext-`, `external-`, and
-`langchain-` channels and returns compact structured results:
+tool searches every cached channel type—including `customer-`, `eval-`,
+`internal-`, `ext-`, `external-`, `langchain-`, and future prefixes—and returns
+compact structured results:
 
 - `matched`: one deterministic exact normalized match.
 - `ambiguous`: multiple exact matches or bounded possible matches requiring
   review.
 - `unmatched`: no candidate channel.
 
-Every match includes `channel_id`, `channel_name`, `visibility`, and the
-definitive `is_member` value for the authenticated Slack user. The tool does not
-use an LLM for fuzzy matching and accepts at most 200 accounts per call.
+Every match includes `channel_id`, `channel_name`, `channel_type`, `visibility`,
+and the definitive `is_member` value for the authenticated Slack user. The tool
+does not use an LLM for fuzzy matching and accepts at most 200 accounts per call.
+
+Fleet should make one `match_accounts_to_channels` call for the Salesforce
+account set. It should not run separate customer/eval/private listing passes or
+copy the full directory into memory.
 
 Suggested verification requests:
 

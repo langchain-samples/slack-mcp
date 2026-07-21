@@ -288,9 +288,11 @@ class DurableSnapshotTests(unittest.TestCase):
             slack_agent.SNAPSHOT_STORE_KEY,
         )
         lines = item.value["content"].splitlines()
+        names = [json.loads(line)["name"] for line in lines]
 
         self.assertEqual(len(lines), 2)
         self.assertTrue(all(line.startswith("{") for line in lines))
+        self.assertEqual(names, sorted(names))
         self.assertNotIn("topic", item.value["content"])
         self.assertNotIn("purpose", item.value["content"])
         self.assertEqual(
@@ -379,13 +381,32 @@ class AccountMatchingTests(unittest.TestCase):
                     "is_private": True,
                     "is_member": True,
                 },
+                {
+                    "id": "C5",
+                    "name": "partner-northwind",
+                    "is_private": False,
+                    "is_member": True,
+                },
+                {
+                    "id": "C6",
+                    "name": "general",
+                    "is_private": False,
+                    "is_member": True,
+                },
             ],
         )
 
     def test_matches_accounts_with_membership_and_all_supported_prefixes(self):
         result = json.loads(
             slack_agent.match_accounts_to_channels(
-                ["Housecall Pro, Inc.", "Cognite", "Oracle", "Missing Co"],
+                [
+                    "Housecall Pro, Inc.",
+                    "Cognite",
+                    "Oracle",
+                    "Northwind",
+                    "General",
+                    "Missing Co",
+                ],
                 self.caller,
             )
         )["accounts"]
@@ -395,7 +416,10 @@ class AccountMatchingTests(unittest.TestCase):
         self.assertEqual(result[1]["matches"][0]["visibility"], "private")
         self.assertEqual(result[1]["matches"][0]["is_member"], True)
         self.assertEqual(result[2]["matches"][0]["channel_name"], "internal-oracle")
-        self.assertEqual(result[3]["status"], "unmatched")
+        self.assertEqual(result[2]["matches"][0]["channel_type"], "internal")
+        self.assertEqual(result[3]["matches"][0]["channel_type"], "partner")
+        self.assertEqual(result[4]["matches"][0]["channel_type"], "unprefixed")
+        self.assertEqual(result[5]["status"], "unmatched")
 
     def test_ambiguous_exact_and_possible_matches_are_not_guessed(self):
         result = json.loads(

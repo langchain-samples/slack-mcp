@@ -42,14 +42,6 @@ LEGACY_SNAPSHOT_STORE_KEY = "/directory.json"
 MAX_ACCOUNT_MATCH_INPUTS = 200
 MAX_ACCOUNT_NAME_LENGTH = 200
 MAX_POSSIBLE_MATCHES = 10
-MATCH_CHANNEL_PREFIXES = (
-    "customer-",
-    "eval-",
-    "internal-",
-    "ext-",
-    "external-",
-    "langchain-",
-)
 COMPANY_SUFFIXES = {
     "co",
     "company",
@@ -549,17 +541,18 @@ def _account_slugs(account: str) -> set[str]:
     return variants
 
 
-def _channel_prefix(name: str) -> str | None:
-    return next(
-        (prefix for prefix in MATCH_CHANNEL_PREFIXES if name.startswith(prefix)),
-        None,
-    )
+def _channel_type_and_suffix(name: str) -> tuple[str, str]:
+    """Split any Slack name into its leading type and account-like suffix."""
+    channel_type, separator, suffix = name.partition("-")
+    return (channel_type, suffix) if separator else ("unprefixed", name)
 
 
 def _match_payload(channel: Channel, match_type: str) -> dict[str, object]:
+    channel_type, _ = _channel_type_and_suffix(channel["name"])
     return {
         "channel_id": channel["id"],
         "channel_name": channel["name"],
+        "channel_type": channel_type,
         "is_member": channel["is_member"],
         "match_type": match_type,
         "visibility": "private" if channel["is_private"] else "public",
@@ -572,10 +565,7 @@ def _match_one_account(account: str, channels: list[Channel]) -> dict[str, objec
     possible: list[Channel] = []
     for channel in channels:
         name = channel["name"]
-        prefix = _channel_prefix(name)
-        if prefix is None:
-            continue
-        suffix = name[len(prefix) :]
+        _, suffix = _channel_type_and_suffix(name)
         if suffix in variants:
             exact.append(channel)
         elif any(

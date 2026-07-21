@@ -31,7 +31,7 @@
     },
     "refresh_channels": {
       "path": "./slack_agent.py:refresh_channels_graph",
-      "description": "Refresh the caller's durable Slack channel snapshot from Slack."
+      "description": "Refresh the durable Slack channel snapshot for the authenticated caller."
     }
   },
   "env": ".env"

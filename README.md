@@ -23,11 +23,11 @@ Store the token in an untracked `.env` file:
 
 ```sh
 SLACK_USER_TOKEN=xoxb-...
-LANGSMITH_API_KEY_GATEWAY=<gateway-user-service-key>
+LANGSMITH_API_GATEWAY_TOKEN=<gateway-user-service-key>
 ```
 
 `SLACK_USER_TOKEN` must have `channels:read` and `groups:read`. The Gateway key
-must use the `gateway-user` role. `LANGSMITH_API_KEY_GATEWAY` is the only
+must use the `gateway-user` role. `LANGSMITH_API_GATEWAY_TOKEN` is the only
 supported Gateway credential name; `SLACK_TOKEN` remains a local Slack-token
 fallback.
 
@@ -41,7 +41,7 @@ uv run python -c 'from slack_agent import agent; print(agent.invoke({"messages":
 ## LangSmith Deployment
 
 Deploy the repository and configure `SLACK_USER_TOKEN` and
-`LANGSMITH_API_KEY_GATEWAY` as deployment secrets. Do not put either token in
+`LANGSMITH_API_GATEWAY_TOKEN` as deployment secrets. Do not put either token in
 source control. The Anthropic provider key remains in the LangSmith workspace's
 Gateway configuration and is not needed by this deployment. The graph is
 automatically available as the `list_private_slack_channels` tool at the

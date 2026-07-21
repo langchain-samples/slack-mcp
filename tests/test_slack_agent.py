@@ -7,7 +7,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.web.slack_response import SlackResponse
 
 os.environ.setdefault("SLACK_USER_TOKEN", "test-slack-token")
-os.environ.setdefault("LANGSMITH_API_KEY_GATEWAY", "test-gateway-token")
+os.environ.setdefault("LANGSMITH_API_GATEWAY_TOKEN", "test-gateway-token")
 
 slack_agent = importlib.import_module("slack_agent")
 

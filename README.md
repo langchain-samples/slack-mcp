@@ -62,6 +62,25 @@ controlled tool argument. Channel results reflect the caller's own visibility.
 The Slack token is never written to the filesystem or placed in graph state,
 model messages, tool results, or application logs.
 
+## Add the server in Arcade
+ 
+1. In Arcade, go to **Servers** and select **Add Server**.
+2. Choose **Remote MCP**.
+3. Give the server a user-specific name, such as `MCP-Slack-Channels-Liam`.
+4. Enter this exact URL, with no trailing slash:
+```text
+   https://slack-private-channel-read-ffbdd8bf080155209516781f051ac271.us.langgraph.app/mcp
+```
+ 
+5. Add these two custom headers:
+   | Header | Value |
+   | --- | --- |
+   | `x-api-key` | The user's valid LangSmith API key |
+   | `x-slack-user-token` | The user's Slack user OAuth token |
+6. Save the server. Arcade sends both headers automatically on every MCP
+   request.
+7. Request IT to add to Fleet. The MCP will appear in "Integrations" tab.
+
 ## Fleet custom MCP setup
 
 Each Fleet user must configure the MCP with their own Slack user token. Do not
